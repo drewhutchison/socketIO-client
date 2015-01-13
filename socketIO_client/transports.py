@@ -7,6 +7,7 @@ import socket
 import time
 import websocket
 from itertools import izip
+from ssl import CERT_NONE
 
 from .exceptions import SocketIOError, ConnectionError, TimeoutError
 
@@ -122,7 +123,9 @@ class _WebsocketTransport(_AbstractTransport):
             'wss' if is_secure else 'ws',
             base_url, socketIO_session.id)
         try:
-            self._connection = websocket.create_connection(url)
+            self._connection = websocket.create_connection(url,
+                                                           sslopt = {'cert_reqs':
+                                                             CERT_NONE})
         except socket.timeout as e:
             raise ConnectionError(e)
         except socket.error as e:
