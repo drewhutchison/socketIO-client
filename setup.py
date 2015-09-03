@@ -9,7 +9,7 @@ CHANGES = open(os.path.join(here, 'CHANGES.rst')).read()
 
 setup(
     name='socketIO-client',
-    version='0.5.3',
+    version='0.5.6',
     description='A socket.io client library',
     long_description=README + '\n\n' + CHANGES,
     license='MIT',
@@ -27,6 +27,10 @@ setup(
         'six',
         'websocket-client',
     ],
+    tests_require=[
+        'nose',
+        'coverage',
+    ],
     packages=find_packages(),
     include_package_data=True,
-    zip_safe=True)
+    zip_safe=False)

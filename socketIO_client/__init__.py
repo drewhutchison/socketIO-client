@@ -3,12 +3,20 @@ import json
 import requests
 import time
 from collections import namedtuple
-from urlparse import urlparse
+try:
+    from urllib.parse import urlparse as parse_url
+except ImportError:
+    from urlparse import urlparse as parse_url
 
-from .exceptions import ConnectionError, TimeoutError, PacketError
-from .transports import _get_response, _negotiate_transport, TRANSPORTS
+from .exceptions import (
+    SocketIOError, ConnectionError, TimeoutError, PacketError)
+from .symmetries import _get_text
+from .transports import (
+    _get_response, TRANSPORTS,
+    _WebsocketTransport, _XHR_PollingTransport, _JSONP_PollingTransport)
 
 
+__version__ = '0.5.4'
 _SocketIOSession = namedtuple('_SocketIOSession', [
     'id',
     'heartbeat_timeout',
@@ -25,6 +33,7 @@ class BaseNamespace(object):
     def __init__(self, _transport, path):
         self._transport = _transport
         self.path = path
+        self._was_connected = False
         self._callback_by_event = {}
         self.initialize()
 
@@ -48,19 +57,19 @@ class BaseNamespace(object):
 
     def on_connect(self):
         'Called after server connects; you can override this method'
-        _log.debug('%s [connect]', self.path)
+        pass
 
     def on_disconnect(self):
         'Called after server disconnects; you can override this method'
-        _log.debug('%s [disconnect]', self.path)
+        pass
 
     def on_heartbeat(self):
         'Called after server sends a heartbeat; you can override this method'
-        _log.debug('%s [heartbeat]', self.path)
+        pass
 
     def on_message(self, data):
         'Called after server sends a message; you can override this method'
-        _log.info('%s [message] %s', self.path, data)
+        pass
 
     def on_event(self, event, *args):
         """
@@ -69,31 +78,28 @@ class BaseNamespace(object):
         such as one defined by namespace.on('my_event', my_function).
         """
         callback, args = find_callback(args)
-        arguments = [repr(_) for _ in args]
         if callback:
-            arguments.append('callback(*args)')
             callback(*args)
-        _log.info('%s [event] %s(%s)', self.path, event, ', '.join(arguments))
 
     def on_error(self, reason, advice):
         'Called after server sends an error; you can override this method'
-        _log.info('%s [error] %s', self.path, advice)
+        pass
 
     def on_noop(self):
         'Called after server sends a noop; you can override this method'
-        _log.info('%s [noop]', self.path)
+        pass
 
     def on_open(self, *args):
-        _log.info('%s [open] %s', self.path, args)
+        pass
 
     def on_close(self, *args):
-        _log.info('%s [close] %s', self.path, args)
+        pass
 
     def on_retry(self, *args):
-        _log.info('%s [retry] %s', self.path, args)
+        pass
 
     def on_reconnect(self, *args):
-        _log.info('%s [reconnect] %s', self.path, args)
+        pass
 
     def _find_event_callback(self, event):
         # Check callbacks defined by on()
@@ -101,6 +107,12 @@ class BaseNamespace(object):
             return self._callback_by_event[event]
         except KeyError:
             pass
+        # Convert connect to reconnect if we have seen connect already
+        if event == 'connect':
+            if not self._was_connected:
+                self._was_connected = True
+            else:
+                event = 'reconnect'
         # Check callbacks defined explicitly or use on_event()
         return getattr(
             self,
@@ -108,14 +120,70 @@ class BaseNamespace(object):
             lambda *args: self.on_event(event, *args))
 
 
+class LoggingNamespace(BaseNamespace):
+
+    def _log(self, level, msg, *attrs):
+        _log.log(level, '%s: %s' % (self._transport._url, msg), *attrs)
+
+    def on_connect(self):
+        self._log(logging.DEBUG, '%s [connect]', self.path)
+        super(LoggingNamespace, self).on_connect()
+
+    def on_disconnect(self):
+        self._log(logging.DEBUG, '%s [disconnect]', self.path)
+        super(LoggingNamespace, self).on_disconnect()
+
+    def on_heartbeat(self):
+        self._log(logging.DEBUG, '%s [heartbeat]', self.path)
+        super(LoggingNamespace, self).on_heartbeat()
+
+    def on_message(self, data):
+        self._log(logging.INFO, '%s [message] %s', self.path, data)
+        super(LoggingNamespace, self).on_message(data)
+
+    def on_event(self, event, *args):
+        callback, args = find_callback(args)
+        arguments = [repr(_) for _ in args]
+        if callback:
+            arguments.append('callback(*args)')
+        self._log(logging.INFO, '%s [event] %s(%s)', self.path, event,
+                  ', '.join(arguments))
+        super(LoggingNamespace, self).on_event(event, *args)
+
+    def on_error(self, reason, advice):
+        self._log(logging.INFO, '%s [error] %s', self.path, advice)
+        super(LoggingNamespace, self).on_error(reason, advice)
+
+    def on_noop(self):
+        self._log(logging.INFO, '%s [noop]', self.path)
+        super(LoggingNamespace, self).on_noop()
+
+    def on_open(self, *args):
+        self._log(logging.INFO, '%s [open] %s', self.path, args)
+        super(LoggingNamespace, self).on_open(*args)
+
+    def on_close(self, *args):
+        self._log(logging.INFO, '%s [close] %s', self.path, args)
+        super(LoggingNamespace, self).on_close(*args)
+
+    def on_retry(self, *args):
+        self._log(logging.INFO, '%s [retry] %s', self.path, args)
+        super(LoggingNamespace, self).on_retry(*args)
+
+    def on_reconnect(self, *args):
+        self._log(logging.INFO, '%s [reconnect] %s', self.path, args)
+        super(LoggingNamespace, self).on_reconnect(*args)
+
+
 class SocketIO(object):
+
     """Create a socket.io client that connects to a socket.io server
     at the specified host and port.
 
     - Define the behavior of the client by specifying a custom Namespace.
     - Prefix host with https:// to use SSL.
     - Set wait_for_connection=True to block until we have a connection.
-    - Specify the transports you want to use.
+    - Specify desired transports=['websocket', 'xhr-polling'].
     - Pass query params, headers, cookies, proxies as keyword arguments.
 
     SocketIO('localhost', 8000,
@@ -126,14 +194,19 @@ class SocketIO(object):
     """
 
     def __init__(
-            self, host, port=None, Namespace=BaseNamespace,
-            wait_for_connection=True, transports=TRANSPORTS, **kw):
-        self.is_secure, self.base_url = _parse_host(host, port)
+            self, host, port=None, Namespace=None,
+            wait_for_connection=True, transports=TRANSPORTS,
+            resource='socket.io', **kw):
+        self.is_secure, self._base_url = _parse_host(host, port, resource)
         self.wait_for_connection = wait_for_connection
         self._namespace_by_path = {}
-        self.client_supported_transports = transports
-        self.kw = kw
-        self.define(Namespace)
+        self._client_supported_transports = transports
+        self._kw = kw
+        if Namespace:
+            self.define(Namespace)
+
+    def _log(self, level, msg, *attrs):
+        _log.log(level, '%s: %s' % (self._base_url, msg), *attrs)
 
     def __enter__(self):
         return self
@@ -152,6 +225,8 @@ class SocketIO(object):
         return namespace
 
     def on(self, event, callback, path=''):
+        if path not in self._namespace_by_path:
+            self.define(BaseNamespace, path)
         return self.get_namespace(path).on(event, callback)
 
     def message(self, data='', callback=None, path=''):
@@ -167,33 +242,35 @@ class SocketIO(object):
 
         - Omit seconds, i.e. call wait() without arguments, to wait forever.
         """
-        try:
-            warning_screen = _yield_warning_screen(seconds)
-            for elapsed_time in warning_screen:
-                if self._stop_waiting(for_callbacks):
-                    break
+        warning_screen = _yield_warning_screen(seconds)
+        timeout = min(self._heartbeat_interval, seconds)
+        for elapsed_time in warning_screen:
+            if self._stop_waiting(for_callbacks):
+                break
+            try:
                 try:
-                    try:
-                        self._process_events()
-                    except TimeoutError:
-                        pass
-                    self.heartbeat_pacemaker.send(elapsed_time)
-                except ConnectionError as e:
-                    try:
-                        warning = Exception('[connection error] %s' % e)
-                        warning_screen.throw(warning)
-                    except StopIteration:
-                        _log.warn(warning)
-                    self.disconnect()
-        except KeyboardInterrupt:
-            pass
+                    self._process_events(timeout)
+                except TimeoutError:
+                    pass
+                next(self._heartbeat_pacemaker)
+            except ConnectionError as e:
+                try:
+                    warning = Exception('[connection error] %s' % e)
+                    warning_screen.throw(warning)
+                except StopIteration:
+                    self._log(logging.WARNING, warning)
+                try:
+                    namespace = self._namespace_by_path['']
+                    namespace.on_disconnect()
+                except KeyError:
+                    pass
 
-    def _process_events(self):
-        for packet in self._transport.recv_packet():
+    def _process_events(self, timeout=None):
+        for packet in self._transport.recv_packet(timeout):
             try:
                 self._process_packet(packet)
             except PacketError as e:
-                _log.warn('[packet error] %s', e)
+                self._log(logging.WARNING, '[packet error] %s', e)
 
     def _process_packet(self, packet):
         code, packet_id, path, data = packet
@@ -213,16 +290,25 @@ class SocketIO(object):
         self.wait(seconds, for_callbacks=True)
 
     def disconnect(self, path=''):
-        if self.connected:
+        try:
             self._transport.disconnect(path)
+        except ReferenceError:
+            pass
+        try:
             namespace = self._namespace_by_path[path]
             namespace.on_disconnect()
-        if path:
             del self._namespace_by_path[path]
+        except KeyError:
+            pass
 
     @property
     def connected(self):
-        return self.__transport.connected
+        try:
+            transport = self.__transport
+        except AttributeError:
+            return False
+        else:
+            return transport.connected
 
     @property
     def _transport(self):
@@ -231,53 +317,83 @@ class SocketIO(object):
                 return self.__transport
         except AttributeError:
             pass
+        socketIO_session = self._get_socketIO_session()
+        supported_transports = self._get_supported_transports(socketIO_session)
+        self._heartbeat_pacemaker = self._make_heartbeat_pacemaker(
+            heartbeat_timeout=socketIO_session.heartbeat_timeout)
+        next(self._heartbeat_pacemaker)
         warning_screen = _yield_warning_screen(seconds=None)
         for elapsed_time in warning_screen:
             try:
-                self.__transport = self._get_transport()
+                self._transport_name = supported_transports.pop(0)
+            except IndexError:
+                raise ConnectionError('Could not negotiate a transport')
+            try:
+                self.__transport = self._get_transport(
+                    socketIO_session, self._transport_name)
                 break
+            except ConnectionError:
+                pass
+        for path, namespace in self._namespace_by_path.items():
+            namespace._transport = self.__transport
+            if path:
+                self.__transport.connect(path)
+        return self.__transport
+
+    def _get_socketIO_session(self):
+        warning_screen = _yield_warning_screen(seconds=None)
+        for elapsed_time in warning_screen:
+            try:
+                return _get_socketIO_session(
+                    self.is_secure, self._base_url, **self._kw)
             except ConnectionError as e:
                 if not self.wait_for_connection:
                     raise
+                warning = Exception('[waiting for connection] %s' % e)
                 try:
-                    warning = Exception('[waiting for connection] %s' % e)
                     warning_screen.throw(warning)
                 except StopIteration:
-                    _log.warn(warning)
-        return self.__transport
+                    self._log(logging.WARNING, warning)
 
-    def _get_transport(self):
-        socketIO_session = _get_socketIO_session(
-            self.is_secure, self.base_url, **self.kw)
-        _log.debug('[transports available] %s', ' '.join(
-            socketIO_session.server_supported_transports))
-        # Initialize heartbeat_pacemaker
-        self.heartbeat_pacemaker = self._make_heartbeat_pacemaker(
-            heartbeat_interval=socketIO_session.heartbeat_timeout / 2)
-        self.heartbeat_pacemaker.next()
-        # Negotiate transport
-        transport = _negotiate_transport(
-            self.client_supported_transports, socketIO_session,
-            self.is_secure, self.base_url, **self.kw)
-        # Update namespaces
-        for path, namespace in self._namespace_by_path.iteritems():
-            namespace._transport = transport
-            transport.connect(path)
-        return transport
+    def _get_supported_transports(self, session):
+        self._log(
+            logging.DEBUG, '[transports available] %s',
+            ' '.join(session.server_supported_transports))
+        supported_transports = [
+            x for x in self._client_supported_transports if
+            x in session.server_supported_transports]
+        if not supported_transports:
+            raise SocketIOError(' '.join([
+                'could not negotiate a transport:',
+                'client supports %s but' % ', '.join(
+                    self._client_supported_transports),
+                'server supports %s' % ', '.join(
+                    session.server_supported_transports),
+            ]))
+        return supported_transports
 
-    def _make_heartbeat_pacemaker(self, heartbeat_interval):
-        heartbeat_time = 0
+    def _get_transport(self, session, transport_name):
+        self._log(logging.DEBUG, '[transport chosen] %s', transport_name)
+        return {
+            'websocket': _WebsocketTransport,
+            'xhr-polling': _XHR_PollingTransport,
+            'jsonp-polling': _JSONP_PollingTransport,
+        }[transport_name](session, self.is_secure, self._base_url, **self._kw)
+
+    def _make_heartbeat_pacemaker(self, heartbeat_timeout):
+        self._heartbeat_interval = heartbeat_timeout / 2
+        heartbeat_time = time.time()
         while True:
-            elapsed_time = (yield)
-            if elapsed_time - heartbeat_time > heartbeat_interval:
-                heartbeat_time = elapsed_time
+            yield
+            if time.time() - heartbeat_time > self._heartbeat_interval:
+                heartbeat_time = time.time()
                 self._transport.send_heartbeat()
 
     def get_namespace(self, path=''):
         try:
             return self._namespace_by_path[path]
         except KeyError:
-            raise PacketError('unexpected namespace path (%s)' % path)
+            raise PacketError('unhandled namespace path (%s)' % path)
 
     def _get_delegate(self, code):
         try:
@@ -361,14 +477,14 @@ def find_callback(args, kw=None):
         return None, args
 
 
-def _parse_host(host, port):
+def _parse_host(host, port, resource):
     if not host.startswith('http'):
         host = 'http://' + host
-    url_pack = urlparse(host)
+    url_pack = parse_url(host)
     is_secure = url_pack.scheme == 'https'
     port = port or url_pack.port or (443 if is_secure else 80)
-    base_url = '%s:%d%s/socket.io/%s' % (
-        url_pack.hostname, port, url_pack.path, PROTOCOL_VERSION)
+    base_url = '%s:%d%s/%s/%s' % (
+        url_pack.hostname, port, url_pack.path, resource, PROTOCOL_VERSION)
     return is_secure, base_url
 
 
@@ -400,7 +516,7 @@ def _get_socketIO_session(is_secure, base_url, **kw):
         response = _get_response(requests.get, server_url, **kw)
     except TimeoutError as e:
         raise ConnectionError(e)
-    response_parts = response.text.split(':')
+    response_parts = _get_text(response).split(':')
     return _SocketIOSession(
         id=response_parts[0],
         heartbeat_timeout=int(response_parts[1]),
