@@ -23,7 +23,7 @@ setup(
     author_email='rhh@crosscompute.com',
     url='https://github.com/invisibleroads/socketIO-client',
     install_requires=[
-        'requests',
+        'requests == 2.9.1',
         'six',
         'websocket-client',
     ],
